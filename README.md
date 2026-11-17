@@ -42,8 +42,20 @@ After a successful connection, the application opens the Vault view, centered on
   - **Search by name**: filters the backends by path as you type. It ignores case and matches partial text.
   - **Type**: filters the backends by type. The options are built from the types found on the server.
   - The refresh button reloads the list from the server.
+  - Click a row (or its arrow button) to open the backend details.
 
-The token must be allowed to read `sys/auth`. A root token works.
+### Authentication backend details
+
+The details view of a backend shows:
+
+- **General**: path, type, description, accessor, UUID, local, seal wrap, external entropy access and plugin versions.
+- **Configuration**: the mount tuning (default and max lease TTL, token type, etc.).
+- **Options**: the mount options, when there are any.
+- **Roles**: the roles of the backend (`LIST /v1/auth/<path>/<roles endpoint>`), with a search field and a refresh button. Supported types: `alicloud`, `approle`, `aws`, `azure`, `cert`, `cf`, `gcp`, `jwt`, `kubernetes`, `oci`, `oidc`, `saml` and `token`. Other types (such as `userpass` or `ldap`) have no roles.
+
+The back arrow returns to the backend list and keeps the current filters.
+
+The token must be allowed to read `sys/auth` and to list the roles of each backend. A root token works.
 
 ## Project structure
 

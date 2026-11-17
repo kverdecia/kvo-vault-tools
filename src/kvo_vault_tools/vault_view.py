@@ -1,3 +1,6 @@
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 import flet as ft
 import httpx2
 
@@ -10,17 +13,29 @@ def _auth_backend_icon() -> ft.Icon:
     return ft.Icon(AUTH_BACKEND_ICON, size=20, color=ft.Colors.PRIMARY)
 
 
-def _auth_methods_table(methods: list[AuthMethod]) -> ft.DataTable:
+OpenBackend = Callable[[AuthMethod], Awaitable[None]]
+
+
+def _auth_methods_table(methods: list[AuthMethod], on_open: OpenBackend) -> ft.DataTable:
+    def open_handler(method: AuthMethod) -> Callable[[ft.Event], Awaitable[None]]:
+        async def handler(_: ft.Event) -> None:
+            await on_open(method)
+
+        return handler
+
     return ft.DataTable(
+        show_checkbox_column=False,
         columns=[
             ft.DataColumn("Path"),
             ft.DataColumn("Type"),
             ft.DataColumn("Description"),
             ft.DataColumn("Accessor"),
             ft.DataColumn("Local"),
+            ft.DataColumn(""),
         ],
         rows=[
             ft.DataRow(
+                on_select_change=open_handler(method),
                 cells=[
                     ft.DataCell(
                         ft.Row(
@@ -36,6 +51,13 @@ def _auth_methods_table(methods: list[AuthMethod]) -> ft.DataTable:
                     ft.DataCell(method.description or "—"),
                     ft.DataCell(ft.Text(method.accessor, selectable=True)),
                     ft.DataCell("Yes" if method.local else "No"),
+                    ft.DataCell(
+                        ft.IconButton(
+                            ft.Icons.CHEVRON_RIGHT,
+                            tooltip="Show details",
+                            on_click=open_handler(method),
+                        )
+                    ),
                 ]
             )
             for method in methods
@@ -49,8 +71,9 @@ ALL_TYPES = "__all__"
 class AuthenticationSection(ft.Column):
     """Section that lists the authentication backends enabled on the server."""
 
-    def __init__(self, client: VaultClient) -> None:
+    def __init__(self, client: VaultClient, on_open: OpenBackend) -> None:
         self.client = client
+        self.on_open = on_open
         self.methods: list[AuthMethod] = []
         self.search_field = ft.TextField(
             label="Search by name",
@@ -107,7 +130,7 @@ class AuthenticationSection(ft.Column):
             if query in m.path.lower() and selected_type in (ALL_TYPES, m.type)
         ]
         self.body.controls = [
-            _auth_methods_table(methods)
+            _auth_methods_table(methods, self.on_open)
             if methods
             else ft.Text("No authentication backends match the current filters.")
         ]
@@ -142,6 +165,213 @@ class AuthenticationSection(ft.Column):
         return ft.Text(message, color=ft.Colors.ERROR)
 
 
+def _format_ttl(value: Any) -> str:
+    """Format a TTL in seconds; 0 means the system default."""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if seconds == 0:
+        return "System default"
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        amount, seconds = divmod(seconds, size)
+        if amount:
+            parts.append(f"{amount}{unit}")
+    return " ".join(parts)
+
+
+def _format_value(key: str, value: Any) -> str:
+    if key.endswith("_ttl"):
+        return _format_ttl(value)
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value) or "—"
+    if value in (None, ""):
+        return "—"
+    return str(value)
+
+
+def _properties_card(title: str, items: list[tuple[str, str]]) -> ft.Card:
+    rows = [
+        ft.Row(
+            [
+                ft.Text(label, weight=ft.FontWeight.BOLD, width=220),
+                ft.Text(value, selectable=True, expand=True),
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+        for label, value in items
+    ] or [ft.Text("No values.", italic=True)]
+    return ft.Card(
+        content=ft.Container(
+            ft.Column(
+                [ft.Text(title, size=16, weight=ft.FontWeight.BOLD), *rows],
+                spacing=8,
+            ),
+            padding=16,
+        )
+    )
+
+
+def _humanize(key: str) -> str:
+    return key.replace("_", " ").capitalize()
+
+
+class AuthBackendDetail(ft.Column):
+    """Details of one authentication backend, including its roles."""
+
+    def __init__(
+        self,
+        client: VaultClient,
+        method: AuthMethod,
+        on_back: Callable[[], Awaitable[None]],
+    ) -> None:
+        self.client = client
+        self.method = method
+        self.on_back = on_back
+        self.roles: list[str] = []
+        self.role_search = ft.TextField(
+            label="Search roles",
+            prefix_icon=ft.Icons.SEARCH,
+            width=320,
+            on_change=self.on_filter,
+        )
+        self.roles_title = ft.Text("Roles", size=16, weight=ft.FontWeight.BOLD)
+        self.progress = ft.ProgressRing(width=20, height=20, visible=False)
+        self.roles_body = ft.Column(spacing=4)
+
+        general = [
+            ("Path", method.path),
+            ("Type", method.type),
+            ("Description", method.description or "—"),
+            ("Accessor", method.accessor),
+            ("UUID", method.uuid or "—"),
+            ("Local", _format_value("local", method.local)),
+            ("Seal wrap", _format_value("seal_wrap", method.seal_wrap)),
+            (
+                "External entropy access",
+                _format_value("external_entropy_access", method.external_entropy_access),
+            ),
+            ("Plugin version", method.plugin_version or "—"),
+            ("Running plugin version", method.running_plugin_version or "—"),
+        ]
+        config = [(_humanize(k), _format_value(k, v)) for k, v in sorted(method.config.items())]
+        options = [(_humanize(k), _format_value(k, v)) for k, v in sorted(method.options.items())]
+
+        cards = [
+            _properties_card("General", general),
+            _properties_card("Configuration", config),
+        ]
+        if options:
+            cards.append(_properties_card("Options", options))
+
+        super().__init__(
+            controls=[
+                ft.Row(
+                    [
+                        ft.IconButton(
+                            ft.Icons.ARROW_BACK,
+                            tooltip="Back to authentication backends",
+                            on_click=self.on_back_click,
+                        ),
+                        _auth_backend_icon(),
+                        ft.Text(method.path, size=18, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"({method.type})", color=ft.Colors.ON_SURFACE_VARIANT),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                *cards,
+                self._roles_card(),
+            ],
+            spacing=8,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+
+    def _roles_card(self) -> ft.Card:
+        controls: list[ft.Control] = [
+            ft.Row(
+                [
+                    self.roles_title,
+                    ft.IconButton(
+                        ft.Icons.REFRESH,
+                        tooltip="Reload roles",
+                        on_click=self.on_refresh,
+                        visible=self.method.supports_roles,
+                    ),
+                    self.progress,
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        ]
+        if self.method.supports_roles:
+            controls += [self.role_search, self.roles_body]
+        else:
+            controls.append(
+                ft.Text(
+                    f"Authentication backends of type '{self.method.type}' have no roles.",
+                    italic=True,
+                )
+            )
+        return ft.Card(content=ft.Container(ft.Column(controls, spacing=8), padding=16))
+
+    async def on_back_click(self, _: ft.Event) -> None:
+        await self.on_back()
+
+    async def on_refresh(self, _: ft.Event) -> None:
+        await self.load()
+
+    async def on_filter(self, _: ft.Event) -> None:
+        self.render_roles()
+        self.update()
+
+    def render_roles(self) -> None:
+        self.roles_title.value = f"Roles ({len(self.roles)})"
+        if not self.roles:
+            self.roles_body.controls = [ft.Text("This backend has no roles.", italic=True)]
+            return
+        query = (self.role_search.value or "").strip().lower()
+        roles = [r for r in self.roles if query in r.lower()]
+        self.roles_body.controls = (
+            [
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.BADGE, size=18, color=ft.Colors.PRIMARY),
+                        ft.Text(role, selectable=True),
+                    ],
+                    spacing=8,
+                )
+                for role in roles
+            ]
+            if roles
+            else [ft.Text("No roles match the search.", italic=True)]
+        )
+
+    async def load(self) -> None:
+        if not self.method.supports_roles:
+            return
+        self.progress.visible = True
+        self.update()
+        try:
+            self.roles = await self.client.list_auth_roles(self.method)
+        except httpx2.HTTPStatusError as exc:
+            self.roles_body.controls = [
+                AuthenticationSection._error(
+                    f"Vault returned HTTP {exc.response.status_code} while listing roles."
+                )
+            ]
+        except httpx2.HTTPError as exc:
+            self.roles_body.controls = [
+                AuthenticationSection._error(f"Could not reach the Vault server: {exc}")
+            ]
+        else:
+            self.render_roles()
+        finally:
+            self.progress.visible = False
+            self.update()
+
+
 async def show_vault_view(page: ft.Page, client: VaultClient) -> None:
     """Replace the page content with the main Vault view."""
     page.clean()
@@ -152,7 +382,17 @@ async def show_vault_view(page: ft.Page, client: VaultClient) -> None:
     page.scroll = ft.ScrollMode.AUTO
     page.appbar = ft.AppBar(title=ft.Text(f"Vault — {client.url}"))
 
-    auth_section = AuthenticationSection(client)
+    async def show_list() -> None:
+        page.controls = [auth_section]
+        page.update()
+
+    async def open_backend(method: AuthMethod) -> None:
+        detail = AuthBackendDetail(client, method, on_back=show_list)
+        page.controls = [detail]
+        page.update()
+        await detail.load()
+
+    auth_section = AuthenticationSection(client, on_open=open_backend)
     page.add(auth_section)
     await page.window.center()
     await auth_section.load()
