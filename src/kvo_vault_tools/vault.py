@@ -85,6 +85,55 @@ class AppRoleStatus:
         return self.state in (AppRoleState.EXPIRED, AppRoleState.NO_SECRET_IDS)
 
 
+@dataclass(frozen=True)
+class AppRoleSecretId:
+    """Information about one secret ID of an AppRole role (the secret value is never returned)."""
+
+    accessor: str
+    creation_time: datetime | None = None
+    expiration_time: datetime | None = None
+    """None means the secret ID never expires."""
+    last_updated_time: datetime | None = None
+    num_uses: int = 0
+    """Remaining uses; 0 means unlimited."""
+    ttl: int = 0
+    cidr_list: list[str] = field(default_factory=list, hash=False, compare=False)
+    token_bound_cidrs: list[str] = field(default_factory=list, hash=False, compare=False)
+    metadata: dict[str, str] = field(default_factory=dict, hash=False, compare=False)
+
+    @property
+    def is_expired(self) -> bool:
+        return self.expiration_time is not None and self.expiration_time <= datetime.now(UTC)
+
+    @classmethod
+    def from_lookup(cls, accessor: str, data: dict[str, Any]) -> AppRoleSecretId:
+        def as_int(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        return cls(
+            accessor=data.get("secret_id_accessor") or accessor,
+            creation_time=_parse_vault_time(data.get("creation_time")),
+            expiration_time=_parse_vault_time(data.get("expiration_time")),
+            last_updated_time=_parse_vault_time(data.get("last_updated_time")),
+            num_uses=as_int(data.get("secret_id_num_uses")),
+            ttl=as_int(data.get("secret_id_ttl")),
+            cidr_list=list(data.get("cidr_list") or []),
+            token_bound_cidrs=list(data.get("token_bound_cidrs") or []),
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class AppRoleCredentials:
+    """Role ID and secret IDs of an AppRole role."""
+
+    role_id: str
+    secret_ids: list[AppRoleSecretId] = field(default_factory=list, hash=False, compare=False)
+
+
 def _parse_vault_time(value: Any) -> datetime | None:
     """Parse a Vault RFC 3339 timestamp. Returns None for empty or zero times (no expiration)."""
     if not value:
@@ -184,14 +233,57 @@ class VaultClient:
         if not response.json().get("data", {}).get("bind_secret_id", True):
             return AppRoleStatus(AppRoleState.NOT_REQUIRED)
 
+        secret_ids = await self._approle_secret_ids(base, semaphore)
+        if not secret_ids:
+            return AppRoleStatus(AppRoleState.NO_SECRET_IDS)
+
+        now = datetime.now(UTC)
+        expirations = [s.expiration_time for s in secret_ids]
+        valid = [e for e in expirations if e is None or e > now]
+        if valid:
+            expires_at = None if None in valid else max(e for e in valid if e is not None)
+            return AppRoleStatus(AppRoleState.ACTIVE, len(secret_ids), expires_at)
+        return AppRoleStatus(
+            AppRoleState.EXPIRED,
+            len(secret_ids),
+            max(e for e in expirations if e is not None),
+        )
+
+    async def approle_credentials(self, method: AuthMethod, role: str) -> AppRoleCredentials:
+        """Return the role ID and the secret IDs (with their information) of an AppRole role.
+
+        Uses GET .../role/<name>/role-id, LIST .../role/<name>/secret-id and
+        POST .../role/<name>/secret-id-accessor/lookup. Secret IDs are sorted from
+        newest to oldest.
+        """
+        base = f"/auth/{method.mount_path}/role/{role}"
+        semaphore = asyncio.Semaphore(8)
+
+        async def role_id() -> str:
+            async with semaphore:
+                response = await self.request("GET", f"{base}/role-id")
+            response.raise_for_status()
+            return response.json().get("data", {}).get("role_id", "")
+
+        rid, secret_ids = await asyncio.gather(
+            role_id(), self._approle_secret_ids(base, semaphore)
+        )
+        oldest = datetime.min.replace(tzinfo=UTC)
+        secret_ids.sort(key=lambda s: s.creation_time or oldest, reverse=True)
+        return AppRoleCredentials(rid, secret_ids)
+
+    async def _approle_secret_ids(
+        self, base: str, semaphore: asyncio.Semaphore
+    ) -> list[AppRoleSecretId]:
+        """List the secret IDs of an AppRole role and look up each accessor."""
         async with semaphore:
             response = await self.request("GET", f"{base}/secret-id", params={"list": "true"})
         if response.status_code == 404:
-            return AppRoleStatus(AppRoleState.NO_SECRET_IDS)
+            return []
         response.raise_for_status()
         accessors = response.json().get("data", {}).get("keys") or []
 
-        async def lookup(accessor: str) -> dict[str, Any] | None:
+        async def lookup(accessor: str) -> AppRoleSecretId | None:
             async with semaphore:
                 resp = await self.request(
                     "POST",
@@ -202,23 +294,10 @@ class VaultClient:
             if resp.status_code in (204, 404):
                 return None
             resp.raise_for_status()
-            return resp.json().get("data")
+            data = resp.json().get("data")
+            return AppRoleSecretId.from_lookup(accessor, data) if data else None
 
-        secret_ids = [d for d in await asyncio.gather(*map(lookup, accessors)) if d]
-        if not secret_ids:
-            return AppRoleStatus(AppRoleState.NO_SECRET_IDS)
-
-        now = datetime.now(UTC)
-        expirations = [_parse_vault_time(d.get("expiration_time")) for d in secret_ids]
-        valid = [e for e in expirations if e is None or e > now]
-        if valid:
-            expires_at = None if None in valid else max(e for e in valid if e is not None)
-            return AppRoleStatus(AppRoleState.ACTIVE, len(secret_ids), expires_at)
-        return AppRoleStatus(
-            AppRoleState.EXPIRED,
-            len(secret_ids),
-            max(e for e in expirations if e is not None),
-        )
+        return [s for s in await asyncio.gather(*map(lookup, accessors)) if s]
 
     async def aclose(self) -> None:
         await self._http.aclose()

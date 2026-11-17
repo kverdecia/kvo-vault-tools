@@ -6,7 +6,14 @@ from typing import Any
 import flet as ft
 import httpx2
 
-from kvo_vault_tools.vault import AppRoleState, AppRoleStatus, AuthMethod, VaultClient
+from kvo_vault_tools.vault import (
+    AppRoleCredentials,
+    AppRoleSecretId,
+    AppRoleState,
+    AppRoleStatus,
+    AuthMethod,
+    VaultClient,
+)
 
 AUTH_BACKEND_ICON = ft.Icons.KEY
 
@@ -274,6 +281,99 @@ def _approle_status_controls(status: AppRoleStatus | Exception | None) -> list[f
             ]
 
 
+def _secret_id_status_chip(secret_id: AppRoleSecretId) -> ft.Container:
+    if secret_id.is_expired:
+        return _status_chip("Expired", ft.Colors.ERROR)
+    return _status_chip("Active", ft.Colors.GREEN)
+
+
+def _optional_datetime(value: datetime | None, empty: str = "—") -> str:
+    return _format_datetime(value) if value else empty
+
+
+def _secret_ids_table(secret_ids: list[AppRoleSecretId]) -> ft.Control:
+    table = ft.DataTable(
+        show_checkbox_column=False,
+        columns=[
+            ft.DataColumn("Accessor"),
+            ft.DataColumn("Status"),
+            ft.DataColumn("Created"),
+            ft.DataColumn("Expires"),
+            ft.DataColumn("Last updated"),
+            ft.DataColumn("Uses left"),
+            ft.DataColumn("TTL"),
+            ft.DataColumn("CIDR list"),
+            ft.DataColumn("Token bound CIDRs"),
+            ft.DataColumn("Metadata"),
+        ],
+        rows=[
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(ft.Text(s.accessor, selectable=True, font_family="monospace")),
+                    ft.DataCell(_secret_id_status_chip(s)),
+                    ft.DataCell(_optional_datetime(s.creation_time)),
+                    ft.DataCell(_optional_datetime(s.expiration_time, "Never")),
+                    ft.DataCell(_optional_datetime(s.last_updated_time)),
+                    ft.DataCell(str(s.num_uses) if s.num_uses else "Unlimited"),
+                    ft.DataCell(_format_ttl(s.ttl) if s.ttl else "None"),
+                    ft.DataCell(", ".join(s.cidr_list) or "—"),
+                    ft.DataCell(", ".join(s.token_bound_cidrs) or "—"),
+                    ft.DataCell(
+                        ft.Text(
+                            ", ".join(f"{k}={v}" for k, v in sorted(s.metadata.items())) or "—",
+                            selectable=True,
+                        )
+                    ),
+                ]
+            )
+            for s in secret_ids
+        ],
+    )
+    # The table is wide: let it scroll horizontally instead of overflowing.
+    return ft.Row([table], scroll=ft.ScrollMode.AUTO)
+
+
+def _approle_credentials_panel(credentials: AppRoleCredentials | Exception | None) -> ft.Control:
+    """Role ID and secret IDs of an AppRole role, shown under the role when revealed."""
+    if credentials is None:
+        content: ft.Control = ft.Row(
+            [
+                ft.ProgressRing(width=14, height=14, stroke_width=2),
+                ft.Text("Loading role ID and secret IDs…", size=12),
+            ],
+            spacing=8,
+        )
+    elif isinstance(credentials, Exception):
+        content = ft.Text(str(credentials), color=ft.Colors.ERROR)
+    else:
+        count = len(credentials.secret_ids)
+        content = ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Role ID", weight=ft.FontWeight.BOLD, width=120),
+                        ft.Text(
+                            credentials.role_id or "—",
+                            selectable=True,
+                            font_family="monospace",
+                        ),
+                    ],
+                ),
+                ft.Text(f"Secret IDs ({count})", weight=ft.FontWeight.BOLD),
+                _secret_ids_table(credentials.secret_ids)
+                if count
+                else ft.Text("This role has no secret IDs.", italic=True),
+            ],
+            spacing=8,
+        )
+    return ft.Container(
+        content,
+        margin=ft.Margin.only(left=26, bottom=8),
+        padding=ft.Padding.only(left=12, top=4, bottom=4),
+        border=ft.Border.only(left=ft.BorderSide(2, ft.Colors.OUTLINE_VARIANT)),
+    )
+
+
 def _humanize(key: str) -> str:
     return key.replace("_", " ").capitalize()
 
@@ -293,6 +393,8 @@ class AuthBackendDetail(ft.Column):
         self.roles: list[str] = []
         # AppRole only: status of each role (None while it is being checked).
         self.role_statuses: dict[str, AppRoleStatus | Exception | None] = {}
+        # AppRole only: credentials of the revealed roles (None while they are loading).
+        self.revealed: dict[str, AppRoleCredentials | Exception | None] = {}
         self._load_id = 0
         self.role_search = ft.TextField(
             label="Search roles",
@@ -408,26 +510,67 @@ class AuthBackendDetail(ft.Column):
             return
         query = (self.role_search.value or "").strip().lower()
         roles = [r for r in self.roles if query in r.lower()]
-        self.roles_body.controls = (
-            [
-                ft.Row(
-                    [
-                        ft.Icon(ft.Icons.BADGE, size=18, color=ft.Colors.PRIMARY),
-                        ft.Text(role, selectable=True),
-                        *(
-                            _approle_status_controls(self.role_statuses.get(role))
-                            if self.is_approle
-                            else []
-                        ),
-                    ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        if not roles:
+            self.roles_body.controls = [ft.Text("No roles match the search.", italic=True)]
+            return
+        controls: list[ft.Control] = []
+        for role in roles:
+            controls.append(self._role_row(role))
+            if role in self.revealed:
+                controls.append(_approle_credentials_panel(self.revealed[role]))
+        self.roles_body.controls = controls
+
+    def _role_row(self, role: str) -> ft.Row:
+        controls: list[ft.Control] = [
+            ft.Icon(ft.Icons.BADGE, size=18, color=ft.Colors.PRIMARY),
+            ft.Text(role, selectable=True),
+        ]
+        if self.is_approle:
+            controls += _approle_status_controls(self.role_statuses.get(role))
+            revealed = role in self.revealed
+            controls.append(
+                ft.TextButton(
+                    "Hide" if revealed else "Reveal",
+                    icon=ft.Icons.VISIBILITY_OFF if revealed else ft.Icons.VISIBILITY,
+                    tooltip=None if revealed else "Show the role ID and the secret IDs",
+                    on_click=self._reveal_handler(role),
                 )
-                for role in roles
-            ]
-            if roles
-            else [ft.Text("No roles match the search.", italic=True)]
-        )
+            )
+        return ft.Row(controls, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def _reveal_handler(self, role: str) -> Callable[[ft.Event], Awaitable[None]]:
+        async def handler(_: ft.Event) -> None:
+            await self.toggle_reveal(role)
+
+        return handler
+
+    async def toggle_reveal(self, role: str) -> None:
+        """Show (fetching them) or hide the role ID and secret IDs of an AppRole role."""
+        if role in self.revealed:
+            del self.revealed[role]
+            self.render_roles()
+            self.update()
+            return
+        load_id = self._load_id
+        self.revealed[role] = None
+        self.render_roles()
+        self.update()
+        try:
+            credentials: AppRoleCredentials | Exception = await self.client.approle_credentials(
+                self.method, role
+            )
+        except httpx2.HTTPStatusError as exc:
+            credentials = Exception(
+                f"Vault returned HTTP {exc.response.status_code} while reading the role credentials."
+            )
+        except httpx2.HTTPError as exc:
+            credentials = Exception(f"Could not reach the Vault server: {exc}")
+        # Drop the result if the roles were reloaded or the role was hidden meanwhile.
+        if load_id != self._load_id or role not in self.revealed:
+            return
+        self.revealed[role] = credentials
+        self.render_roles()
+        self.update()
 
     async def load(self) -> None:
         if not self.method.supports_roles:
@@ -439,6 +582,7 @@ class AuthBackendDetail(ft.Column):
         try:
             self.roles = await self.client.list_auth_roles(self.method)
             self.role_statuses = {role: None for role in self.roles} if self.is_approle else {}
+            self.revealed = {}
         except httpx2.HTTPStatusError as exc:
             self.roles_body.controls = [
                 AuthenticationSection._error(
