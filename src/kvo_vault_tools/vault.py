@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 import httpx2
@@ -5,6 +6,18 @@ import httpx2
 
 class VaultConnectionError(Exception):
     """Raised when a connection to the Vault server cannot be established."""
+
+
+@dataclass(frozen=True)
+class AuthMethod:
+    """An authentication backend enabled on the Vault server."""
+
+    path: str
+    type: str
+    description: str
+    accessor: str
+    local: bool
+    seal_wrap: bool
 
 
 class VaultClient:
@@ -26,6 +39,28 @@ class VaultClient:
         response = await self.request("GET", "/auth/token/lookup-self")
         response.raise_for_status()
         return response.json()["data"]
+
+    async def list_auth_methods(self) -> list[AuthMethod]:
+        """Return the enabled authentication backends (GET /v1/sys/auth), sorted by path."""
+        response = await self.request("GET", "/sys/auth")
+        response.raise_for_status()
+        body = response.json()
+        mounts = body.get("data", body)
+        return sorted(
+            (
+                AuthMethod(
+                    path=path,
+                    type=info.get("type", ""),
+                    description=info.get("description", ""),
+                    accessor=info.get("accessor", ""),
+                    local=bool(info.get("local", False)),
+                    seal_wrap=bool(info.get("seal_wrap", False)),
+                )
+                for path, info in mounts.items()
+                if isinstance(info, dict) and "type" in info
+            ),
+            key=lambda method: method.path,
+        )
 
     async def aclose(self) -> None:
         await self._http.aclose()
