@@ -58,6 +58,7 @@ The details view of a backend shows:
     - **No expiration**: the role has `bind_secret_id=false`, so it doesn't use secret IDs.
     - The roles title shows how many roles have expired.
     - Each role has a **Reveal** button. Click it to show the role's **role ID** (`GET .../role/<name>/role-id`) and its **secret IDs**, newest first, each with its accessor, status (active/expired), creation, expiration and last-update times, remaining uses, TTL, CIDR list, token bound CIDRs and metadata. Vault never returns the secret ID values, only their accessors. Click **Hide** to collapse it.
+    - Each role (except those with `bind_secret_id=false`) has a **New secret ID** button. It creates a secret ID (`POST .../role/<name>/secret-id`) and shows it in a dialog with a **Copy** button, its accessor, TTL and allowed uses. Copy it right away: Vault only returns the value when it is created, so once the dialog is closed it can't be retrieved. The role status, and the secret ID list if it is revealed, are then reloaded.
 
 The back arrow returns to the backend list and keeps the current filters.
 
