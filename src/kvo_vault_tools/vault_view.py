@@ -1,10 +1,12 @@
+import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
 
 import flet as ft
 import httpx2
 
-from kvo_vault_tools.vault import AuthMethod, VaultClient
+from kvo_vault_tools.vault import AppRoleState, AppRoleStatus, AuthMethod, VaultClient
 
 AUTH_BACKEND_ICON = ft.Icons.KEY
 
@@ -215,6 +217,63 @@ def _properties_card(title: str, items: list[tuple[str, str]]) -> ft.Card:
     )
 
 
+def _format_datetime(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _status_chip(text: str, color: ft.Colors, tooltip: str | None = None) -> ft.Container:
+    return ft.Container(
+        ft.Text(text, size=12, color=color, weight=ft.FontWeight.BOLD),
+        border=ft.Border.all(1, color),
+        border_radius=12,
+        padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+        tooltip=tooltip,
+    )
+
+
+def _approle_status_controls(status: AppRoleStatus | Exception | None) -> list[ft.Control]:
+    """Chip (and detail text) that tells whether an AppRole role has expired."""
+    if status is None:
+        return [
+            ft.ProgressRing(width=12, height=12, stroke_width=2),
+            ft.Text("Checking…", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+        ]
+    if isinstance(status, Exception):
+        return [_status_chip("Unknown", ft.Colors.ON_SURFACE_VARIANT, tooltip=str(status))]
+
+    count = f"{status.secret_id_count} secret ID{'s' if status.secret_id_count != 1 else ''}"
+    match status.state:
+        case AppRoleState.ACTIVE:
+            detail = (
+                f"expires {_format_datetime(status.expires_at)}"
+                if status.expires_at
+                else "never expires"
+            )
+            chip = _status_chip("Active", ft.Colors.GREEN)
+            return [chip, ft.Text(f"{count}, {detail}", size=12)]
+        case AppRoleState.EXPIRED:
+            chip = _status_chip("Expired", ft.Colors.ERROR)
+            detail = f"{count}, all expired"
+            if status.expires_at:
+                detail += f" (last on {_format_datetime(status.expires_at)})"
+            return [chip, ft.Text(detail, size=12)]
+        case AppRoleState.NO_SECRET_IDS:
+            chip = _status_chip(
+                "Expired",
+                ft.Colors.ERROR,
+                tooltip="The role needs a secret ID to log in but has none.",
+            )
+            return [chip, ft.Text("no secret IDs", size=12)]
+        case AppRoleState.NOT_REQUIRED:
+            return [
+                _status_chip(
+                    "No expiration",
+                    ft.Colors.ON_SURFACE_VARIANT,
+                    tooltip="bind_secret_id is false: the role does not use secret IDs.",
+                ),
+            ]
+
+
 def _humanize(key: str) -> str:
     return key.replace("_", " ").capitalize()
 
@@ -232,6 +291,9 @@ class AuthBackendDetail(ft.Column):
         self.method = method
         self.on_back = on_back
         self.roles: list[str] = []
+        # AppRole only: status of each role (None while it is being checked).
+        self.role_statuses: dict[str, AppRoleStatus | Exception | None] = {}
+        self._load_id = 0
         self.role_search = ft.TextField(
             label="Search roles",
             prefix_icon=ft.Icons.SEARCH,
@@ -326,8 +388,21 @@ class AuthBackendDetail(ft.Column):
         self.render_roles()
         self.update()
 
+    @property
+    def is_approle(self) -> bool:
+        return self.method.type == "approle"
+
     def render_roles(self) -> None:
-        self.roles_title.value = f"Roles ({len(self.roles)})"
+        title = f"Roles ({len(self.roles)})"
+        if self.is_approle:
+            expired = sum(
+                1
+                for s in self.role_statuses.values()
+                if isinstance(s, AppRoleStatus) and s.is_expired
+            )
+            if expired:
+                title += f" — {expired} expired"
+        self.roles_title.value = title
         if not self.roles:
             self.roles_body.controls = [ft.Text("This backend has no roles.", italic=True)]
             return
@@ -339,8 +414,14 @@ class AuthBackendDetail(ft.Column):
                     [
                         ft.Icon(ft.Icons.BADGE, size=18, color=ft.Colors.PRIMARY),
                         ft.Text(role, selectable=True),
+                        *(
+                            _approle_status_controls(self.role_statuses.get(role))
+                            if self.is_approle
+                            else []
+                        ),
                     ],
                     spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 )
                 for role in roles
             ]
@@ -351,10 +432,13 @@ class AuthBackendDetail(ft.Column):
     async def load(self) -> None:
         if not self.method.supports_roles:
             return
+        self._load_id += 1
+        load_id = self._load_id
         self.progress.visible = True
         self.update()
         try:
             self.roles = await self.client.list_auth_roles(self.method)
+            self.role_statuses = {role: None for role in self.roles} if self.is_approle else {}
         except httpx2.HTTPStatusError as exc:
             self.roles_body.controls = [
                 AuthenticationSection._error(
@@ -367,9 +451,34 @@ class AuthBackendDetail(ft.Column):
             ]
         else:
             self.render_roles()
+            if self.is_approle:
+                self.update()
+                await self.load_approle_statuses(load_id)
         finally:
-            self.progress.visible = False
+            if load_id == self._load_id:
+                self.progress.visible = False
+                self.update()
+
+    async def load_approle_statuses(self, load_id: int) -> None:
+        """Check whether each AppRole role has expired, refreshing the list as results arrive."""
+        semaphore = asyncio.Semaphore(8)
+
+        async def check(role: str) -> None:
+            try:
+                status: AppRoleStatus | Exception = await self.client.approle_role_status(
+                    self.method, role, semaphore
+                )
+            except httpx2.HTTPStatusError as exc:
+                status = Exception(f"Vault returned HTTP {exc.response.status_code}.")
+            except httpx2.HTTPError as exc:
+                status = Exception(f"Could not reach the Vault server: {exc}")
+            if load_id != self._load_id:
+                return  # A newer reload started; drop stale results.
+            self.role_statuses[role] = status
+            self.render_roles()
             self.update()
+
+        await asyncio.gather(*(check(role) for role in self.roles))
 
 
 async def show_vault_view(page: ft.Page, client: VaultClient) -> None:

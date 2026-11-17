@@ -1,4 +1,7 @@
+import asyncio
+import enum
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx2
@@ -52,6 +55,49 @@ ROLE_ENDPOINTS: dict[str, str] = {
     "saml": "role",
     "token": "roles",
 }
+
+
+class AppRoleState(enum.Enum):
+    """Whether an AppRole role can still be used to log in."""
+
+    ACTIVE = "active"
+    """At least one secret ID has not expired."""
+    EXPIRED = "expired"
+    """The role has secret IDs, but all of them have expired."""
+    NO_SECRET_IDS = "no_secret_ids"
+    """The role requires a secret ID but has none (never created, or already tidied)."""
+    NOT_REQUIRED = "not_required"
+    """The role does not require a secret ID (``bind_secret_id=false``), so it never expires."""
+
+
+@dataclass(frozen=True)
+class AppRoleStatus:
+    """Expiration status of an AppRole role, based on its secret IDs."""
+
+    state: AppRoleState
+    secret_id_count: int = 0
+    expires_at: datetime | None = None
+    """For ACTIVE: latest expiration of the valid secret IDs (None means never).
+    For EXPIRED: when the last secret ID expired."""
+
+    @property
+    def is_expired(self) -> bool:
+        return self.state in (AppRoleState.EXPIRED, AppRoleState.NO_SECRET_IDS)
+
+
+def _parse_vault_time(value: Any) -> datetime | None:
+    """Parse a Vault RFC 3339 timestamp. Returns None for empty or zero times (no expiration)."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.year <= 1:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 class VaultClient:
@@ -119,6 +165,60 @@ class VaultClient:
         response.raise_for_status()
         keys = response.json().get("data", {}).get("keys") or []
         return sorted(keys)
+
+    async def approle_role_status(
+        self, method: AuthMethod, role: str, concurrency: asyncio.Semaphore | None = None
+    ) -> AppRoleStatus:
+        """Return whether an AppRole role has expired, based on its secret IDs.
+
+        A role whose secret IDs have all expired (or that has none) cannot be used
+        to log in, so it is considered expired. Roles with ``bind_secret_id=false``
+        never expire.
+        """
+        semaphore = concurrency or asyncio.Semaphore(8)
+        base = f"/auth/{method.mount_path}/role/{role}"
+
+        async with semaphore:
+            response = await self.request("GET", base)
+        response.raise_for_status()
+        if not response.json().get("data", {}).get("bind_secret_id", True):
+            return AppRoleStatus(AppRoleState.NOT_REQUIRED)
+
+        async with semaphore:
+            response = await self.request("GET", f"{base}/secret-id", params={"list": "true"})
+        if response.status_code == 404:
+            return AppRoleStatus(AppRoleState.NO_SECRET_IDS)
+        response.raise_for_status()
+        accessors = response.json().get("data", {}).get("keys") or []
+
+        async def lookup(accessor: str) -> dict[str, Any] | None:
+            async with semaphore:
+                resp = await self.request(
+                    "POST",
+                    f"{base}/secret-id-accessor/lookup",
+                    json={"secret_id_accessor": accessor},
+                )
+            # The secret ID may have been deleted or tidied between the list and the lookup.
+            if resp.status_code in (204, 404):
+                return None
+            resp.raise_for_status()
+            return resp.json().get("data")
+
+        secret_ids = [d for d in await asyncio.gather(*map(lookup, accessors)) if d]
+        if not secret_ids:
+            return AppRoleStatus(AppRoleState.NO_SECRET_IDS)
+
+        now = datetime.now(UTC)
+        expirations = [_parse_vault_time(d.get("expiration_time")) for d in secret_ids]
+        valid = [e for e in expirations if e is None or e > now]
+        if valid:
+            expires_at = None if None in valid else max(e for e in valid if e is not None)
+            return AppRoleStatus(AppRoleState.ACTIVE, len(secret_ids), expires_at)
+        return AppRoleStatus(
+            AppRoleState.EXPIRED,
+            len(secret_ids),
+            max(e for e in expirations if e is not None),
+        )
 
     async def aclose(self) -> None:
         await self._http.aclose()
