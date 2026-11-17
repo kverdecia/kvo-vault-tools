@@ -52,6 +52,11 @@ The details view of a backend shows:
 - **Configuration**: the mount tuning (default and max lease TTL, token type, etc.).
 - **Options**: the mount options, when there are any.
 - **Roles**: the roles of the backend (`LIST /v1/auth/<path>/<roles endpoint>`), with a search field and a refresh button. Supported types: `alicloud`, `approle`, `aws`, `azure`, `cert`, `cf`, `gcp`, `jwt`, `kubernetes`, `oci`, `oidc`, `saml` and `token`. Other types (such as `userpass` or `ldap`) have no roles.
+  - For `approle` backends, each role shows whether it has expired. AppRole roles have no expiration of their own; what expires are their secret IDs. So the status is worked out from the role's secret IDs (`LIST .../role/<name>/secret-id` and `POST .../secret-id-accessor/lookup`):
+    - **Active**: at least one secret ID has not expired. Shows how many there are and when the last one expires (or "never expires").
+    - **Expired**: every secret ID has expired, or the role has none, so it can't be used to log in.
+    - **No expiration**: the role has `bind_secret_id=false`, so it doesn't use secret IDs.
+    - The roles title shows how many roles have expired.
 
 The back arrow returns to the backend list and keeps the current filters.
 
