@@ -1,6 +1,6 @@
 # kvo-vault-tools
 
-Desktop application built with [Python](https://www.python.org/) and [Flet](https://flet.dev/) to run checks and maintenance tasks on a [HashiCorp Vault](https://www.vaultproject.io/) server.
+Desktop application built with [Python](https://www.python.org/) and [Flet](https://flet.dev/) to run checks and maintenance tasks on a [HashiCorp Vault](https://www.vaultproject.io/) server. It also ships an equivalent console (TUI) application built with [Textual](https://textual.textualize.io/).
 
 ## Requirements
 
@@ -64,6 +64,35 @@ The back arrow returns to the backend list and keeps the current filters.
 
 The token must be allowed to read `sys/auth` and to list the roles of each backend. A root token works.
 
+### Console (TUI) version
+
+The same features are available in the terminal:
+
+```bash
+uv run kvo-vault-tools-tui
+```
+
+or `uv run python -m kvo_vault_tools.tui`.
+
+The connection screen is filled in from the `VAULT_ADDR` and `VAULT_TOKEN` environment variables when they are set. The screens work like the desktop ones; the keyboard shortcuts are shown in the footer:
+
+| Screen | Key | Action |
+| --- | --- | --- |
+| Connection | `Enter` | Move to the token field / connect |
+| | `Ctrl+T` | Show or hide the token |
+| Backend list | `Enter` | Open the highlighted backend |
+| | `Ctrl+F` | Go to the search field |
+| | `F5` | Reload the backends |
+| Backend details | `Esc` | Back to the backend list (keeps the filters) |
+| | `Ctrl+F` | Go to the role search field |
+| | `F5` | Reload the roles |
+| | `Enter` / `Ctrl+R` | AppRole: reveal or hide the role ID and secret IDs of the highlighted role |
+| | `Ctrl+N` | AppRole: create a new secret ID for the highlighted role |
+| New secret ID dialog | `Ctrl+Y` | Copy the secret ID |
+| Anywhere | `Ctrl+Q` | Quit |
+
+The **Copy** button sends the secret ID to the system clipboard (`pbcopy`, `wl-copy`, `xclip`, `xsel` or `clip`, whichever is installed) and to the terminal clipboard (OSC 52, which also works over SSH in most terminals).
+
 ## Project structure
 
 ```
@@ -76,6 +105,8 @@ kvo-vault-tools/
         ├── __main__.py     # Application entry point (main)
         ├── app.py          # Connection screen (Flet)
         ├── vault_view.py   # Vault view and Authentication section (Flet)
+        ├── tui.py          # Console version of the application (Textual)
+        ├── formatting.py   # Text formatting helpers shared by both interfaces
         └── vault.py        # Vault HTTP API client (httpx2)
 ```
 

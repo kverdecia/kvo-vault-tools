@@ -1,11 +1,17 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
 from typing import Any
 
 import flet as ft
 import httpx2
 
+from kvo_vault_tools.formatting import (
+    format_datetime,
+    format_ttl,
+    format_value,
+    humanize,
+    optional_datetime,
+)
 from kvo_vault_tools.vault import (
     AppRoleCredentials,
     AppRoleSecretId,
@@ -175,34 +181,6 @@ class AuthenticationSection(ft.Column):
         return ft.Text(message, color=ft.Colors.ERROR)
 
 
-def _format_ttl(value: Any) -> str:
-    """Format a TTL in seconds; 0 means the system default."""
-    try:
-        seconds = int(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if seconds == 0:
-        return "System default"
-    parts = []
-    for unit, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
-        amount, seconds = divmod(seconds, size)
-        if amount:
-            parts.append(f"{amount}{unit}")
-    return " ".join(parts)
-
-
-def _format_value(key: str, value: Any) -> str:
-    if key.endswith("_ttl"):
-        return _format_ttl(value)
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-    if isinstance(value, list):
-        return ", ".join(str(v) for v in value) or "—"
-    if value in (None, ""):
-        return "—"
-    return str(value)
-
-
 def _properties_card(title: str, items: list[tuple[str, str]]) -> ft.Card:
     rows = [
         ft.Row(
@@ -223,10 +201,6 @@ def _properties_card(title: str, items: list[tuple[str, str]]) -> ft.Card:
             padding=16,
         )
     )
-
-
-def _format_datetime(value: datetime) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def _status_chip(text: str, color: ft.Colors, tooltip: str | None = None) -> ft.Container:
@@ -253,7 +227,7 @@ def _approle_status_controls(status: AppRoleStatus | Exception | None) -> list[f
     match status.state:
         case AppRoleState.ACTIVE:
             detail = (
-                f"expires {_format_datetime(status.expires_at)}"
+                f"expires {format_datetime(status.expires_at)}"
                 if status.expires_at
                 else "never expires"
             )
@@ -263,7 +237,7 @@ def _approle_status_controls(status: AppRoleStatus | Exception | None) -> list[f
             chip = _status_chip("Expired", ft.Colors.ERROR)
             detail = f"{count}, all expired"
             if status.expires_at:
-                detail += f" (last on {_format_datetime(status.expires_at)})"
+                detail += f" (last on {format_datetime(status.expires_at)})"
             return [chip, ft.Text(detail, size=12)]
         case AppRoleState.NO_SECRET_IDS:
             chip = _status_chip(
@@ -288,10 +262,6 @@ def _secret_id_status_chip(secret_id: AppRoleSecretId) -> ft.Container:
     return _status_chip("Active", ft.Colors.GREEN)
 
 
-def _optional_datetime(value: datetime | None, empty: str = "—") -> str:
-    return _format_datetime(value) if value else empty
-
-
 def _secret_ids_table(secret_ids: list[AppRoleSecretId]) -> ft.Control:
     table = ft.DataTable(
         show_checkbox_column=False,
@@ -312,11 +282,11 @@ def _secret_ids_table(secret_ids: list[AppRoleSecretId]) -> ft.Control:
                 cells=[
                     ft.DataCell(ft.Text(s.accessor, selectable=True, font_family="monospace")),
                     ft.DataCell(_secret_id_status_chip(s)),
-                    ft.DataCell(_optional_datetime(s.creation_time)),
-                    ft.DataCell(_optional_datetime(s.expiration_time, "Never")),
-                    ft.DataCell(_optional_datetime(s.last_updated_time)),
+                    ft.DataCell(optional_datetime(s.creation_time)),
+                    ft.DataCell(optional_datetime(s.expiration_time, "Never")),
+                    ft.DataCell(optional_datetime(s.last_updated_time)),
                     ft.DataCell(str(s.num_uses) if s.num_uses else "Unlimited"),
-                    ft.DataCell(_format_ttl(s.ttl) if s.ttl else "None"),
+                    ft.DataCell(format_ttl(s.ttl) if s.ttl else "None"),
                     ft.DataCell(", ".join(s.cidr_list) or "—"),
                     ft.DataCell(", ".join(s.token_bound_cidrs) or "—"),
                     ft.DataCell(
@@ -387,7 +357,7 @@ def _new_secret_id_dialog(
 
     details = [
         ("Accessor", generated.accessor or "—"),
-        ("TTL", _format_ttl(generated.ttl) if generated.ttl else "Never expires"),
+        ("TTL", format_ttl(generated.ttl) if generated.ttl else "Never expires"),
         ("Uses", str(generated.num_uses) if generated.num_uses else "Unlimited"),
     ]
     return ft.AlertDialog(
@@ -449,10 +419,6 @@ def _new_secret_id_dialog(
     )
 
 
-def _humanize(key: str) -> str:
-    return key.replace("_", " ").capitalize()
-
-
 class AuthBackendDetail(ft.Column):
     """Details of one authentication backend, including its roles."""
 
@@ -489,17 +455,17 @@ class AuthBackendDetail(ft.Column):
             ("Description", method.description or "—"),
             ("Accessor", method.accessor),
             ("UUID", method.uuid or "—"),
-            ("Local", _format_value("local", method.local)),
-            ("Seal wrap", _format_value("seal_wrap", method.seal_wrap)),
+            ("Local", format_value("local", method.local)),
+            ("Seal wrap", format_value("seal_wrap", method.seal_wrap)),
             (
                 "External entropy access",
-                _format_value("external_entropy_access", method.external_entropy_access),
+                format_value("external_entropy_access", method.external_entropy_access),
             ),
             ("Plugin version", method.plugin_version or "—"),
             ("Running plugin version", method.running_plugin_version or "—"),
         ]
-        config = [(_humanize(k), _format_value(k, v)) for k, v in sorted(method.config.items())]
-        options = [(_humanize(k), _format_value(k, v)) for k, v in sorted(method.options.items())]
+        config = [(humanize(k), format_value(k, v)) for k, v in sorted(method.config.items())]
+        options = [(humanize(k), format_value(k, v)) for k, v in sorted(method.options.items())]
 
         cards = [
             _properties_card("General", general),
