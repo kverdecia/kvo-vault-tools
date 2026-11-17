@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from kvo-vault-tools!")
+    from kvo_vault_tools.app import run
+
+    run()
