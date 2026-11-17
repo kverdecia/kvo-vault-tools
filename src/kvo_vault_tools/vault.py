@@ -134,6 +134,22 @@ class AppRoleCredentials:
     secret_ids: list[AppRoleSecretId] = field(default_factory=list, hash=False, compare=False)
 
 
+@dataclass(frozen=True)
+class GeneratedSecretId:
+    """A secret ID just created for an AppRole role.
+
+    This is the only moment Vault returns the secret ID value; afterwards only its
+    accessor can be read.
+    """
+
+    secret_id: str
+    accessor: str
+    ttl: int = 0
+    """Seconds until it expires; 0 means it never expires."""
+    num_uses: int = 0
+    """Allowed uses; 0 means unlimited."""
+
+
 def _parse_vault_time(value: Any) -> datetime | None:
     """Parse a Vault RFC 3339 timestamp. Returns None for empty or zero times (no expiration)."""
     if not value:
@@ -271,6 +287,21 @@ class VaultClient:
         oldest = datetime.min.replace(tzinfo=UTC)
         secret_ids.sort(key=lambda s: s.creation_time or oldest, reverse=True)
         return AppRoleCredentials(rid, secret_ids)
+
+    async def approle_generate_secret_id(self, method: AuthMethod, role: str) -> GeneratedSecretId:
+        """Create a new secret ID for an AppRole role (POST .../role/<name>/secret-id).
+
+        The returned value can't be read again later, so the caller must show it.
+        """
+        response = await self.request("POST", f"/auth/{method.mount_path}/role/{role}/secret-id")
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        return GeneratedSecretId(
+            secret_id=data.get("secret_id", ""),
+            accessor=data.get("secret_id_accessor", ""),
+            ttl=int(data.get("secret_id_ttl") or 0),
+            num_uses=int(data.get("secret_id_num_uses") or 0),
+        )
 
     async def _approle_secret_ids(
         self, base: str, semaphore: asyncio.Semaphore

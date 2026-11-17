@@ -12,6 +12,7 @@ from kvo_vault_tools.vault import (
     AppRoleState,
     AppRoleStatus,
     AuthMethod,
+    GeneratedSecretId,
     VaultClient,
 )
 
@@ -374,6 +375,80 @@ def _approle_credentials_panel(credentials: AppRoleCredentials | Exception | Non
     )
 
 
+def _new_secret_id_dialog(
+    role: str, generated: GeneratedSecretId, on_close: Callable[[ft.Event], Any]
+) -> ft.AlertDialog:
+    """Modal dialog that shows a secret ID just created, with a copy button."""
+    copied = ft.Text("", size=12, color=ft.Colors.GREEN)
+
+    async def on_copy(_: ft.Event) -> None:
+        copied.value = "Copied to the clipboard."
+        copied.update()
+
+    details = [
+        ("Accessor", generated.accessor or "—"),
+        ("TTL", _format_ttl(generated.ttl) if generated.ttl else "Never expires"),
+        ("Uses", str(generated.num_uses) if generated.num_uses else "Unlimited"),
+    ]
+    return ft.AlertDialog(
+        modal=True,
+        title=ft.Text(f"New secret ID for '{role}'"),
+        content=ft.Column(
+            [
+                ft.Container(
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.ON_ERROR_CONTAINER),
+                            ft.Text(
+                                "Copy this secret ID now. Vault won't show it again: "
+                                "once you close this dialog, you can't get it back.",
+                                color=ft.Colors.ON_ERROR_CONTAINER,
+                                weight=ft.FontWeight.BOLD,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    bgcolor=ft.Colors.ERROR_CONTAINER,
+                    border_radius=8,
+                    padding=12,
+                ),
+                ft.Row(
+                    [
+                        ft.Text(
+                            generated.secret_id,
+                            selectable=True,
+                            font_family="monospace",
+                            expand=True,
+                        ),
+                        ft.FilledButton(
+                            "Copy",
+                            icon=ft.Icons.COPY,
+                            action=ft.CopyToClipboard(generated.secret_id),
+                            on_click=on_copy,
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                copied,
+                *(
+                    ft.Row(
+                        [
+                            ft.Text(label, weight=ft.FontWeight.BOLD, width=100),
+                            ft.Text(value, selectable=True, font_family="monospace"),
+                        ]
+                    )
+                    for label, value in details
+                ),
+            ],
+            spacing=12,
+            tight=True,
+            width=560,
+        ),
+        actions=[ft.TextButton("Close", on_click=on_close)],
+    )
+
+
 def _humanize(key: str) -> str:
     return key.replace("_", " ").capitalize()
 
@@ -395,6 +470,8 @@ class AuthBackendDetail(ft.Column):
         self.role_statuses: dict[str, AppRoleStatus | Exception | None] = {}
         # AppRole only: credentials of the revealed roles (None while they are loading).
         self.revealed: dict[str, AppRoleCredentials | Exception | None] = {}
+        # AppRole only: roles whose new secret ID is being created.
+        self.generating: set[str] = set()
         self._load_id = 0
         self.role_search = ft.TextField(
             label="Search roles",
@@ -536,6 +613,19 @@ class AuthBackendDetail(ft.Column):
                     on_click=self._reveal_handler(role),
                 )
             )
+            status = self.role_statuses.get(role)
+            # Roles with bind_secret_id=false don't use secret IDs.
+            if not (isinstance(status, AppRoleStatus) and status.state is AppRoleState.NOT_REQUIRED):
+                generating = role in self.generating
+                controls.append(
+                    ft.TextButton(
+                        "Creating…" if generating else "New secret ID",
+                        icon=ft.Icons.ADD,
+                        tooltip="Create a new secret ID for this role",
+                        disabled=generating,
+                        on_click=self._new_secret_id_handler(role),
+                    )
+                )
         return ft.Row(controls, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     def _reveal_handler(self, role: str) -> Callable[[ft.Event], Awaitable[None]]:
@@ -543,6 +633,63 @@ class AuthBackendDetail(ft.Column):
             await self.toggle_reveal(role)
 
         return handler
+
+    def _new_secret_id_handler(self, role: str) -> Callable[[ft.Event], Awaitable[None]]:
+        async def handler(_: ft.Event) -> None:
+            await self.create_secret_id(role)
+
+        return handler
+
+    async def create_secret_id(self, role: str) -> None:
+        """Create a secret ID for an AppRole role and show it once, so it can be copied."""
+        if role in self.generating:
+            return
+        self.generating.add(role)
+        self.render_roles()
+        self.update()
+        try:
+            generated = await self.client.approle_generate_secret_id(self.method, role)
+        except httpx2.HTTPStatusError as exc:
+            error = f"Vault returned HTTP {exc.response.status_code} while creating the secret ID."
+        except httpx2.HTTPError as exc:
+            error = f"Could not reach the Vault server: {exc}"
+        else:
+            error = None
+        finally:
+            self.generating.discard(role)
+            self.render_roles()
+            self.update()
+
+        if error is not None:
+            self.page.show_dialog(ft.SnackBar(ft.Text(error), bgcolor=ft.Colors.ERROR_CONTAINER))
+            return
+
+        def on_close(_: ft.Event) -> None:
+            self.page.pop_dialog()
+
+        self.page.show_dialog(_new_secret_id_dialog(role, generated, on_close))
+        await self.refresh_role(role)
+
+    async def refresh_role(self, role: str) -> None:
+        """Reload the status (and the credentials, if revealed) of one AppRole role."""
+        load_id = self._load_id
+        try:
+            status: AppRoleStatus | Exception = await self.client.approle_role_status(
+                self.method, role
+            )
+        except httpx2.HTTPStatusError as exc:
+            status = Exception(f"Vault returned HTTP {exc.response.status_code}.")
+        except httpx2.HTTPError as exc:
+            status = Exception(f"Could not reach the Vault server: {exc}")
+        if load_id != self._load_id:
+            return
+        self.role_statuses[role] = status
+        self.render_roles()
+        self.update()
+        if role in self.revealed:
+            # Hide and reveal again to fetch the new secret ID list.
+            del self.revealed[role]
+            await self.toggle_reveal(role)
 
     async def toggle_reveal(self, role: str) -> None:
         """Show (fetching them) or hide the role ID and secret IDs of an AppRole role."""
