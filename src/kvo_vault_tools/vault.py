@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx2
@@ -18,6 +18,40 @@ class AuthMethod:
     accessor: str
     local: bool
     seal_wrap: bool
+    uuid: str = ""
+    external_entropy_access: bool = False
+    plugin_version: str = ""
+    running_plugin_version: str = ""
+    config: dict[str, Any] = field(default_factory=dict, hash=False, compare=False)
+    options: dict[str, Any] = field(default_factory=dict, hash=False, compare=False)
+
+    @property
+    def mount_path(self) -> str:
+        """Path of the backend without the trailing slash (e.g. ``approle``)."""
+        return self.path.rstrip("/")
+
+    @property
+    def supports_roles(self) -> bool:
+        return self.type in ROLE_ENDPOINTS
+
+
+# Sub-path that lists the roles of each authentication backend type
+# (LIST /v1/auth/<mount>/<sub-path>). Types not listed here have no roles.
+ROLE_ENDPOINTS: dict[str, str] = {
+    "alicloud": "role",
+    "approle": "role",
+    "aws": "roles",
+    "azure": "role",
+    "cert": "certs",
+    "cf": "roles",
+    "gcp": "role",
+    "jwt": "role",
+    "kubernetes": "role",
+    "oci": "role",
+    "oidc": "role",
+    "saml": "role",
+    "token": "roles",
+}
 
 
 class VaultClient:
@@ -55,12 +89,36 @@ class VaultClient:
                     accessor=info.get("accessor", ""),
                     local=bool(info.get("local", False)),
                     seal_wrap=bool(info.get("seal_wrap", False)),
+                    uuid=info.get("uuid", ""),
+                    external_entropy_access=bool(info.get("external_entropy_access", False)),
+                    plugin_version=info.get("plugin_version", ""),
+                    running_plugin_version=info.get("running_plugin_version", ""),
+                    config=info.get("config") or {},
+                    options=info.get("options") or {},
                 )
                 for path, info in mounts.items()
                 if isinstance(info, dict) and "type" in info
             ),
             key=lambda method: method.path,
         )
+
+    async def list_auth_roles(self, method: AuthMethod) -> list[str]:
+        """Return the role names of an authentication backend, sorted.
+
+        Uses LIST /v1/auth/<mount>/<role endpoint>. Returns an empty list when the
+        backend has no roles (Vault answers 404) or its type does not support roles.
+        """
+        endpoint = ROLE_ENDPOINTS.get(method.type)
+        if endpoint is None:
+            return []
+        response = await self.request(
+            "GET", f"/auth/{method.mount_path}/{endpoint}", params={"list": "true"}
+        )
+        if response.status_code == 404:
+            return []
+        response.raise_for_status()
+        keys = response.json().get("data", {}).get("keys") or []
+        return sorted(keys)
 
     async def aclose(self) -> None:
         await self._http.aclose()
