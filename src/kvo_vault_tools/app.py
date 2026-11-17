@@ -1,6 +1,7 @@
 import flet as ft
 
 from kvo_vault_tools.vault import VaultConnectionError, connect
+from kvo_vault_tools.vault_view import show_vault_view
 
 
 async def main(page: ft.Page) -> None:
@@ -42,17 +43,17 @@ async def main(page: ft.Page) -> None:
         page.update()
 
         try:
-            page.session.store.set("vault_client", await connect(url, token))
+            client = await connect(url, token)
         except VaultConnectionError as exc:
             status.value = str(exc)
             status.color = ft.Colors.ERROR
-        else:
-            status.value = f"Connected to {url}"
-            status.color = ft.Colors.GREEN
-        finally:
             connect_button.disabled = False
             progress.visible = False
             page.update()
+            return
+
+        page.session.store.set("vault_client", client)
+        await show_vault_view(page, client)
 
     connect_button = ft.FilledButton("Connect", on_click=on_connect)
     async def focus_token(_: ft.Event) -> None:
