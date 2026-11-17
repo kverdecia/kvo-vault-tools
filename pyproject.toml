@@ -11,10 +11,12 @@ dependencies = [
     "flet>=1.1.2",
     "flet-desktop>=1.1.2",
     "httpx2>=2.16.2",
+    "textual>=8.2.8",
 ]
 
 [project.scripts]
 kvo-vault-tools = "kvo_vault_tools.__main__:main"
+kvo-vault-tools-tui = "kvo_vault_tools.tui:main"
 
 [build-system]
 requires = ["uv_build>=0.13.4,<0.14.0"]
